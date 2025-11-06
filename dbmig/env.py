@@ -3,8 +3,12 @@ from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from alembic import context
+from alembic.script import ScriptDirectory
+from alembic.script.revision import ResolutionError
 
 # Import your Base object here
 from core.database import Base # Corrected import path for Base
@@ -77,11 +81,92 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
 
+    script_directory = ScriptDirectory.from_config(config)
+    version_table = "alembic_version_backend"
+
+    def prune_overlapping_versions(connection) -> None:
+        """Remove ancestor revisions lingering in the version table.
+
+        When a previous run leaves both a head and one of its ancestors in the
+        version table, Alembic treats them as independent targets and aborts
+        with an "overlaps" error. Deleting the ancestor rows restores the
+        expected single-head state while leaving true multi-branch situations
+        untouched.
+        """
+
+        try:
+            rows = connection.execute(
+                text(f"SELECT version_num FROM {version_table}")
+            ).fetchall()
+        except SQLAlchemyError:
+            return
+
+        version_ids = [row[0] for row in rows if row[0]]
+        if len(version_ids) <= 1:
+            return
+
+        ancestors_cache: dict[str, set[str]] = {}
+
+        def ancestor_set(revision_id: str) -> set[str]:
+            if revision_id in ancestors_cache:
+                return ancestors_cache[revision_id]
+
+            stack = [revision_id]
+            seen: set[str] = set()
+
+            while stack:
+                current = stack.pop()
+                if current is None or current in seen:
+                    continue
+
+                seen.add(current)
+                try:
+                    revision = script_directory.get_revision(current)
+                except ResolutionError:
+                    continue
+
+                down = revision.down_revision
+                if not down:
+                    continue
+
+                if isinstance(down, (tuple, list, set)):
+                    stack.extend(down)
+                else:
+                    stack.append(down)
+
+            seen.discard(revision_id)
+            ancestors_cache[revision_id] = seen
+            return seen
+
+        to_remove: set[str] = set()
+
+        for revision_id in version_ids:
+            ancestors = ancestor_set(revision_id)
+            for candidate in version_ids:
+                if candidate == revision_id:
+                    continue
+                if candidate in ancestors:
+                    to_remove.add(candidate)
+
+        if not to_remove:
+            return
+
+        for revision_id in to_remove:
+            connection.execute(
+                text(
+                    f"DELETE FROM {version_table} WHERE version_num = :revision_id"
+                ),
+                {"revision_id": revision_id},
+            )
+
+        connection.commit()
+
     with connectable.connect() as connection:
+        prune_overlapping_versions(connection)
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            version_table="alembic_version_backend",
+            version_table=version_table,
         )
 
         with context.begin_transaction():

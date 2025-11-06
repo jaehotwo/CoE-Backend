@@ -32,7 +32,13 @@ RUN uv pip install --system --no-cache -r requirements.in
 COPY . .
 
 # pidpy 로컬 휠 설치 (vendor 폴더 포함)
-RUN pip install /app/vendor/pidpy/pidpy-1.3.19-py3-none-linux_x86_64.whl
+# Git LFS 포인터만 있는 경우 빌드가 실패하므로 내용 검증 후 설치합니다.
+RUN PID_WHEEL="/app/vendor/pidpy/pidpy-1.3.19-py3-none-linux_x86_64.whl" && \
+    if [ -f "$PID_WHEEL" ] && ! head -n 1 "$PID_WHEEL" | grep -q "version https://git-lfs.github.com/spec/v1"; then \
+        pip install "$PID_WHEEL"; \
+    else \
+        echo "Skipping pidpy installation (wheel missing or Git LFS pointer detected)"; \
+    fi
 
 # 6. 로그 디렉토리 생성 및 권한 설정
 RUN mkdir -p /app/logs && \

@@ -4,6 +4,8 @@ from typing import Dict, Any, Optional, List
 import httpx
 
 from core.schemas import AgentState
+from fastapi import APIRouter, UploadFile, File, HTTPException, status
+from pydantic import BaseModel
 
 
 # Prefer explicit URL via RAG_PIPELINE_URL, fallback to default service DNS in Compose
@@ -87,7 +89,7 @@ async def run(tool_input: Optional[Dict[str, Any]], state: AgentState) -> Dict[s
         else:
             return {"messages": [{"role": "assistant", "content": "제목 또는 내용이 필요합니다."}]}
 
-    url = f"{RAG_BASE}/api/v1/itsd/recommend-assignee"
+    url = f"{RAG_BASE}/api/v1/analysis/itsd/recommend-assignee"
 
     payload = {
         "title": title,
@@ -106,13 +108,7 @@ async def run(tool_input: Optional[Dict[str, Any]], state: AgentState) -> Dict[s
         params["top_k_each"] = top_k_each
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(url, json=payload, params=params)
-            resp.raise_for_status()
-        # RAG returns a JSON string (Markdown content)
-        content = resp.json()
-        if not isinstance(content, str):
-            content = str(content)
+        content = await fetch_assignee_recommendation(payload, params)
         return {"messages": [{"role": "assistant", "content": content}]}
     except httpx.HTTPStatusError as e:
         return {
@@ -125,6 +121,21 @@ async def run(tool_input: Optional[Dict[str, Any]], state: AgentState) -> Dict[s
         }
     except httpx.RequestError as e:
         return {"messages": [{"role": "assistant", "content": f"ITSD 추천 호출 오류: {e}"}]}
+
+
+async def fetch_assignee_recommendation(
+    payload: Dict[str, Any],
+    params: Dict[str, Any],
+    base_url: Optional[str] = None,
+) -> str:
+    """Call the RAG pipeline and return the Markdown recommendation."""
+
+    url = f"{(base_url or RAG_BASE).rstrip('/')}/api/v1/analysis/itsd/recommend-assignee"
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(url, json=payload, params=params)
+        resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, str) else str(data)
 
 
 # Tool schema exposed to the LLM
@@ -174,3 +185,126 @@ available_tools: List[Dict[str, Any]] = [
 tool_functions: Dict[str, Any] = {
     "itsd_recommend_assignee": run,
 }
+
+
+# FastAPI router for ITSD dataset tooling (proxying RAG pipeline APIs)
+router = APIRouter(prefix="/itsd", tags=["ITSD"])
+
+
+class ItsdProxyRecommendationRequest(BaseModel):
+    title: str
+    description: str
+
+
+@router.post(
+    "/recommend-assignee",
+    summary="ITSD 담당자 추천 (proxy)",
+    response_model=str,
+)
+async def recommend_assignee_proxy(
+    req: ItsdProxyRecommendationRequest,
+    page: int = 1,
+    page_size: int = 5,
+    use_rrf: bool | None = None,
+    w_title: float | None = None,
+    w_content: float | None = None,
+    rrf_k0: int | None = None,
+    top_k_each: int | None = None,
+) -> str:
+    params: Dict[str, Any] = {"page": page, "page_size": page_size}
+    if use_rrf is not None:
+        params["use_rrf"] = use_rrf
+    if w_title is not None:
+        params["w_title"] = w_title
+    if w_content is not None:
+        params["w_content"] = w_content
+    if rrf_k0 is not None:
+        params["rrf_k0"] = rrf_k0
+    if top_k_each is not None:
+        params["top_k_each"] = top_k_each
+
+    try:
+        return await fetch_assignee_recommendation(req.model_dump(), params)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=500, detail=f"ITSD 추천 호출 오류: {exc}")
+
+
+@router.post(
+    "/embed-requests",
+    summary="ITSD 요청 데이터(Excel) 임베딩 (proxy)",
+)
+async def embed_requests_proxy(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Excel(.xlsx) 파일만 업로드할 수 있습니다.",
+        )
+
+    url = f"{RAG_BASE}/api/v1/datasets/itsd/embed-excel"
+    contents = await file.read()
+    files = {
+        "file": (
+            file.filename,
+            contents,
+            file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    }
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(url, files=files)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"RAG ITSD embed failed: {exc}")
+
+
+@router.post(
+    "/embed-requests-async",
+    summary="ITSD 요청 데이터(Excel) 임베딩 — 비동기 (proxy)",
+)
+async def embed_requests_async_proxy(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Excel(.xlsx) 파일만 업로드할 수 있습니다.",
+        )
+
+    url = f"{RAG_BASE}/api/v1/datasets/itsd/embed-excel-async"
+    contents = await file.read()
+    files = {
+        "file": (
+            file.filename,
+            contents,
+            file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    }
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(url, files=files)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"RAG ITSD async embed failed: {exc}")
+
+
+@router.get(
+    "/embed-requests-status/{job_id}",
+    summary="임베딩 작업 상태 조회 (proxy)",
+)
+async def embed_status_proxy(job_id: str):
+    url = f"{RAG_BASE}/api/v1/datasets/itsd/embed-jobs/{job_id}"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"RAG ITSD status failed: {exc}")

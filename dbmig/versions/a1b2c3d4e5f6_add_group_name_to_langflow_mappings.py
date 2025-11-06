@@ -1,7 +1,7 @@
 """Add group_name and indexes to langflow_tool_mappings
 
 Revision ID: a1b2c3d4e5f6
-Revises: 9b2d1f7c1a4a
+Revises: a0b1c2d3e4f5
 Create Date: 2025-09-20 09:45:00
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "a1b2c3d4e5f6"
-down_revision: Union[str, None] = "8e9f0a1b2c3d"
+down_revision: Union[str, None] = "a0b1c2d3e4f5"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
